@@ -87,11 +87,11 @@ def save_configuration(args, config_file="configurations.txt", cmd_file="cmd.sh"
 
 
 
-def load_templates_from_yaml(file_path='templates.yaml'):
-    """Load text templates from a YAML file."""
+def load_prompts_from_yaml(file_path='prompts.yaml'):
+    """Load prompt templates from a YAML file."""
     with open(file_path, 'r') as file:
         data = yaml.safe_load(file)
-    return data['templates'] 
+    return data['prompt_templates'] 
 
 
 def save_checkpoint(state, is_best, args):

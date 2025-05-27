@@ -1,4 +1,8 @@
-# The code is modified version of the original imagecorruption library (pip) to work with newer version of skimage.
+"""
+A fork of the Bethge Lab’s imagecorruptions package, updated for compatibility with recent scikit-image releases.
+
+Original source: https://github.com/bethgelab/imagecorruptions
+"""
 
 import numpy as np
 from PIL import Image

@@ -362,9 +362,9 @@ TRANSFORMS.register_module(module=PackSegInputs, force=True)
 
 
 ### make them args in the main.py and pass them to the file
-data_dir  = '/export/livia/home/vision/Mnoori/old_home/data/segmentation/coco_stuff164k'
+data_dir  = ''
 batch_size = 2 # number of loaded images
-resize = (560, 448) # the size of the image after resizing => it can be vertical or horizontal depending on the image so => (560, 448) or (448, 560)
+resize = (224, 224) # the size of the image after resizing => it can be vertical or horizontal depending on the image so => (560, 448) or (448, 560)
 patch_size = (224, 224) # the size of the patch that will be extracted from the resized image
 patch_stride = 112 # the stride of the patch extraction
 
