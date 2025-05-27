@@ -1,44 +1,70 @@
+import time
 import copy
 from collections import OrderedDict
 
-import clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-torch.nn.Softmax
-# from transformers import AutoProcessor, AutoModel
+from ovss import load_ovss
+from utils.misc import load_prompts_from_yaml, print_clip_parameters, print_optimizer_parameters
 
-from utils.misc import load_templates_from_yaml, print_clip_parameters, print_optimizer_parameters
-
-REFERENCE_TEMPLATE = 'a photo of a {}'
+REFERENCE_PROMPT = 'a photo of a {}'
 
 
 class CLIPARTT:
+    """
+    CLIPArTT adaptation for open-vocabulary semantic segmentation (OVSS) models.
 
-    def __init__(self, backbone, lr, classes, K=3, steps=10,
-                 temp_dir='templates.yaml', interpolate=False,
-                 device='cpu', arch='reduced', attn_strategy='naclip', gaussian_std=5.,):
-        # loading the base model
-        base_model, _ = clip.load(backbone, device)
-        self.model = base_model
-        self.model.visual.set_params(arch, attn_strategy, gaussian_std)
+    Inspired by the original implementation (https://github.com/dosowiechi/CLIPArTT), this method
+    selects the top-K predicted classes per pixel to construct refined text prompts and applies
+    a self-distillation loss to optimize only the visual encoder’s LayerNorm parameters at test time.
+    """
 
+    def __init__(self, ovss_type, ovss_backbone, lr, classes, clipartt_k=3, steps=10, 
+                 prompt_dir=None, runtime_calculation=False, 
+                 device='cpu',
+                 ):
+
+        """
+        Args:
+            ovss_type (str): Identifier for the open-vocabulary segmentation model to load.
+            ovss_backbone (str): Name of the backbone architecture within the OVSS model.
+            lr (float): Learning rate for the LayerNorm optimizer.
+            classes (List[str]): List of class names for prompt generation.
+            clipartt_k (int, optional): Number of top predictions to include in refined prompts. Defaults to 3.
+            steps (int, optional): Number of adaptation iterations per sample. Defaults to 10.
+            prompt_dir (str or None, optional): Path to YAML file with prompt templates. Defaults to None.
+            runtime_calculation (bool, optional): Whether to record adaptation/evaluation runtimes. Defaults to False.
+            device (str, optional): Compute device, e.g., 'cpu' or 'cuda'. Defaults to 'cpu'.
+        """
+
+        self.ovss_type = ovss_type
+        self.ovss_backbone = ovss_backbone
         self.lr = lr
-        self.type = type
-        self.steps = steps
-        self.device = device
-        self.interpolate = interpolate
-        self.K = K
 
-        if temp_dir != 'None':
-            # Load the text templates
-            self.all_templates = load_templates_from_yaml(temp_dir)
-            # print the number of templates
-            print(f"Number of templates: {len(self.all_templates)}")
+        if classes is not None:
+            self.classes = classes
         else:
-            self.all_templates = [REFERENCE_TEMPLATE]
+            raise Exception("Classes are required in the init")
+        
+        self.steps = steps
+        self.k = clipartt_k
+        self.prompt_dir = prompt_dir
+        self.runtime = runtime_calculation
+        self.device = device
+
+        # Load the OVSS model and tokenizer
+        self.model, self.tokenize = load_ovss(self.ovss_type, self.ovss_backbone, device=self.device)
+
+        if self.prompt_dir:
+            # Load the prompt templates
+            self.prompt_templates = load_prompts_from_yaml(prompt_dir)
+            # print the number of prompt templates
+            print(f"Number of prompt templates: {len(self.prompt_templates)}")
+        else:
+            self.prompt_templates = [REFERENCE_PROMPT]
 
         # Set the gradients for LayerNorm layers only for visual encoder
         self.model.transformer.requires_grad_(False)
@@ -60,46 +86,52 @@ class CLIPARTT:
         # Save the initial model and optimizer states
         self.model_state, self.optimizer_state = self.copy_model_and_optimizer(self.model, self.optimizer)
 
-        if classes is not None:
-            self.classes = classes
-        else:
-            raise Exception("Classes are required in the init")
 
         with torch.no_grad():
-            self.text_x = self.extract_text_embeddings(self.classes, self.all_templates,
+            self.text_x = self.extract_text_embeddings(self.classes, self.prompt_templates,
                                                        average=True).squeeze()  # (class, 512)
+            
+        # define variables to store adaptation and evaluation duration
+        if self.runtime:
+            self.adapt_times = []
+            self.eval_times = []
 
-    def adapt(self, x, classes, vision_outputs=(-1,)):
+    
+    def adapt(self, x):
         """
         Forward pass with adaptation.
 
         Args:
-            x: Input image tensor.
-            classes: List of class names.
+            x (torch.Tensor): Input image tensor of shape (batch_size, C, H, W).
 
+        Returns:
+            List[float]: Loss values recorded at each adaptation iteration.
         """
 
         self.reset()
-        loss_report = self.perform_adaptation(x, classes, vision_outputs=vision_outputs)
+        loss_report = self.perform_adaptation(x, self.classes)
         return loss_report
 
     @torch.no_grad()
-    def evaluate(self, x, classes,  vision_outputs=(-1,)):
+    def evaluate(self, x):
         """
         Forward pass without adaptation.
 
         Args:
-            x: Input image tensor.
-            classes: List of class names.
+            x (torch.Tensor): Input image tensor of shape (batch_size, C, H, W).
 
         Returns:
-            pred: Predicted class labels for the input images.
+            torch.Tensor: Per-class logits of shape (batch_size, num_classes, H, W).
 
         """
 
-        logits, _, _ = self.model(x, self.text_x[-1], True, vision_outputs=vision_outputs,
+        t1 = time.time()
+        logits, _, _ = self.model(x, self.text_x[-1], True, 
                                   interpolate=True)  # (#template, batch_size, #classes, H, W)
         logits = logits[0]
+        t2 = time.time()
+        if self.runtime:
+            self.eval_times.append(t2-t1)
 
         return logits
 
@@ -112,30 +144,33 @@ class CLIPARTT:
         self.load_model_and_optimizer(self.model, self.optimizer,
                                       self.model_state, self.optimizer_state)
 
-    def perform_adaptation(self, x, classes, vision_outputs=(-1,)):
+    def perform_adaptation(self, x, classes):
         """
         Forward pass with adaptation for test-time. The model adapts itself during testing by updating on every forward pass.
 
         Args:
-            x: Input image tensor.
-            classes: List of class names.
+            x (torch.Tensor): Input image tensor of shape (batch_size, C, H, W).
+        
+        Returns:
+            List[float]: Recorded loss values for each adaptation iteration.
         """
 
-        text_feat = self.extract_text_embeddings(classes, [REFERENCE_TEMPLATE], average=False).squeeze()
+        t1 = time.time()
+        text_feat = self.extract_text_embeddings(classes, [REFERENCE_PROMPT], average=False).squeeze()
         loss_report = []
         for _ in range(self.steps):
             with torch.no_grad():
-                similarity, _, _ = self.model(x,  text_feat, True, interpolate=self.interpolate)
+                similarity, _, _ = self.model(x,  text_feat, True, interpolate=False)
 
            # similarity = (100.0 * image_features @ text_feat.T).softmax(dim=-1)
-            values, pred = similarity[0].topk(self.K, 1, True, True)
-            pred_flatten = pred.view(-1, self.K)
-            pred_inputs = torch.cat([clip.tokenize(self.getprompt(self.K, c, classes)) for c in pred_flatten]).to(self.device)
+            values, pred = similarity[0].topk(self.k, 1, True, True)
+            pred_flatten = pred.view(-1, self.k)
+            pred_inputs = torch.cat([self.tokenize(self.getprompt(self.k, c, classes)) for c in pred_flatten]).to(self.device)
             # pred_inputs = pred_inputs.view(pred.shape[0],-1,pred.shape[2],pred.shape[3])
 
             # Calculating the Loss
             # cosine similarity as logits
-            logits, image_features, text_features = self.model(x,  pred_inputs, False, interpolate=self.interpolate)
+            logits, image_features, text_features = self.model(x,  pred_inputs, False, interpolate=False)
             image_features = image_features[:, 1:]
             image_features = image_features.reshape(-1, image_features.shape[-1])
             images_similarity = image_features @ image_features.t()
@@ -154,25 +189,29 @@ class CLIPARTT:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+        t2 = time.time()
+        if self.runtime:
+            self.adapt_times.append(t2-t1)
+
         return loss_report
 
-    def extract_text_embeddings(self, class_names, templates, average=True):
+    def extract_text_embeddings(self, class_names, prompts, average=True):
         """
-        Extracts text embeddings for given class names and templates.
+        Extracts text embeddings for given class names and prompts.
 
         Args:
             class_names: List of class names to generate text embeddings for.
-            templates: List of text templates to use for generating text embeddings.
-            average: Boolean indicating whether to average the embeddings of different templates for each class.
+            prompts: List of prompt templates to use for generating text embeddings.
+            average: Boolean indicating whether to average the embeddings of different prompts for each class.
 
         Returns:
-            text_features: Tensor of text embeddings for the given class names and templates.
+            text_features: Tensor of text embeddings for the given class names and prompts.
         """
         text_features = []
         for class_name in class_names:
-            texts = [template.format(class_name) for template in templates]
-            texts = clip.tokenize(texts).to(self.device)
-            class_embeddings = self.model.encode_text(texts)  # Shape: (8, 512)
+            texts = [p.format(class_name) for p in prompts]
+            texts = self.tokenize(texts).to(self.device)
+            class_embeddings = self.model.encode_text(texts)  # Shape: (#templates, 512)
             class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
             if average:
                 class_embeddings_avg = class_embeddings.mean(dim=0)  # Shape: (512,)

@@ -1,7 +1,5 @@
 import time
 import copy
-from collections import OrderedDict
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,31 +11,32 @@ from utils.misc import load_prompts_from_yaml, print_clip_parameters, print_opti
 REFERENCE_PROMPT = 'a photo of a {}'
 
 
-class TENT:
+class MLMP:
     """
-    Test-time adaptation for open-vocabulary semantic segmentation (OVSS) models using TENT.
+    Multi-Layer Multi-Prompt adaptation for open-vocabulary semantic segmentation (OVSS) models.
 
-    Performs iterative optimization of the visual encoder LayerNorm parameters to reduce predictive uncertainty 
-    based on the softmax output distribution.
-
-    Inspired by TENT GitHub: https://github.com/DequanWang/tent
+    Performs test-time adaptation by updating only the visual encoder LayerNorm parameters via 
+    multiple prompt and multiple level optimization. 
     """
 
-    def __init__(self, ovss_type, ovss_backbone, lr, classes, steps=10, 
-                 prompt_dir=None, runtime_calculation=False,
-                 device='cpu', 
+    def __init__(self, ovss_type, ovss_backbone, lr, classes, vision_outputs=(-1,), 
+                 alpha_cls=0.0, steps=10, prompt_dir='prompts.yaml', 
+                 prompt_integration='loss', runtime_calculation=False,
+                 device='cpu',
                  ):
         """
-        Initialize the TENT adaptation module.
+        Initialize the MLMP adaptation module.
 
         Args:
             ovss_type (str): Identifier for the open-vocabulary segmentation model to load.
             ovss_backbone (str): Name of the backbone architecture within the OVSS model.
             lr (float): Learning rate for the LayerNorm optimizer.
-            classes (List[str]): List of class names for prompt generation.
-            steps (int, optional): Number of adaptation iterations per sample. Defaults to 10.
-            prompt_dir (str or None, optional): Path to YAML file with prompt templates. Defaults to None.
-            runtime_calculation (bool, optional): Whether to record adaptation/evaluation runtimes. Defaults to False.
+            classes (List[str]): List of class names used to generate text embeddings.
+            alpha_cls (float, optional): Weight for the classification‐entropy term. Defaults to 0.0.
+            steps (int, optional): Number of test-time adaptation iterations per sample. Defaults to 10.
+            prompt_dir (str, optional): Path to the YAML file containing prompt templates. Defaults to 'prompts.yaml'.
+            prompt_integration (str, optional): Integration mode for prompts, either 'loss' or 'text'. Defaults to 'loss'.
+            runtime_calculation (bool, optional): Whether to track adaptation/evaluation runtimes. Defaults to False.
             device (str, optional): Compute device, e.g., 'cpu' or 'cuda'. Defaults to 'cpu'.
         """
 
@@ -50,21 +49,30 @@ class TENT:
         else:
             raise Exception("Classes are required in the init")
         
-        self.prompt_dir = prompt_dir
+        self.vision_outputs = vision_outputs
+        print(f"+++ The output layers from vision encoder that will be used: {self.vision_outputs}")
+
+        self.alpha_cls = alpha_cls
         self.steps = steps
+        self.prompt_dir = prompt_dir
         self.runtime = runtime_calculation
         self.device = device
+
 
         # Load the OVSS model and tokenizer
         self.model, self.tokenize = load_ovss(self.ovss_type, self.ovss_backbone, device=self.device)
 
         if self.prompt_dir:
             # Load the prompt templates
-            self.prompt_templates = load_prompts_from_yaml(self.prompt_dir)
+            self.prompt_templates = load_prompts_from_yaml(prompt_dir)
             # print the number of prompt templates
             print(f"Number of prompt templates: {len(self.prompt_templates)}")
         else:
             self.prompt_templates = [REFERENCE_PROMPT]
+
+        
+        assert prompt_integration in ['loss', 'text'], "prompt_integration should be either on 'loss' or 'text'"
+        self.prompt_integration = prompt_integration
 
         # Set the gradients for LayerNorm layers only for visual encoder
         self.model.transformer.requires_grad_(False)
@@ -90,7 +98,7 @@ class TENT:
 
         # extracting text features
         with torch.no_grad():
-            self.text_x = self.extract_text_embeddings(self.classes, self.prompt_templates, average=False).squeeze() # (class, 512)
+            self.text_x = self.extract_text_embeddings(self.classes,  self.prompt_templates, average=True).squeeze() # (class, 512)
 
         # define variables to store adaptation and evaluation duration
         if self.runtime:
@@ -112,6 +120,7 @@ class TENT:
         loss_report = self.perform_adaptation(x)
         return loss_report
 
+
     @torch.no_grad() 
     def evaluate(self, x):
         """
@@ -126,8 +135,9 @@ class TENT:
         """
 
         t1 = time.time()
-        logits, _, _ = self.model(x, self.text_x, True, 
-                                  interpolate=True) # (#template, batch_size, #classes, H, W)
+        logits, _, _ = self.model(x, self.text_x[-1], True, vision_outputs=self.vision_outputs, 
+                                  interpolate=True, vision_out_type="adaptive_weighted_mean", 
+                                  save_weights=True) # (#template, batch_size, #classes, H, W)
         logits = logits[0]
         t2 = time.time()
         if self.runtime:
@@ -135,10 +145,12 @@ class TENT:
 
         return logits
 
+
     def reset(self):
         """
         Resets the model and optimizer to their initial states.
         """
+        
         if self.model_state is None or self.optimizer_state is None:
             raise Exception("Cannot reset without saved model/optimizer state")
         self.load_model_and_optimizer(self.model, self.optimizer,
@@ -158,13 +170,30 @@ class TENT:
         t1 = time.time()
         loss_report = []
         for iter in range(self.steps):
-            logits, _, _ = self.model(x, self.text_x, True, 
-                                      interpolate=False)  # (#template, batch_size, #classes, H, W)
-            
-            # adapt
-            entropy_per_pixel = self.softmax_entropy(logits)  # Shape: (#template, batch_size, H, W)
-            # Average over all prompts, pixels and batch samples
-            loss = entropy_per_pixel.mean()
+            if self.prompt_integration == 'loss':
+                logits, _, _, cls_logits = self.model(x, self.text_x[:-1], True, interpolate=False,
+                                                      vision_outputs=self.vision_outputs, return_vanilla_cls=True, 
+                                                      vision_out_type="mean") # (#templates, batch_size, #class, W, H)
+                
+                # adapt
+                entropy_per_pixel = self.softmax_entropy(logits)  # Shape: (#template, batch_size, H, W)
+                entropy_per_cls = self.softmax_entropy(cls_logits, dim=2)
+                
+                # Average over all prompt templates, pixels and batch samples
+                loss = entropy_per_pixel.mean() + self.alpha_cls * entropy_per_cls.mean()
+
+
+            elif self.prompt_integration == 'text':
+                logits, _, _ = self.model(x, self.text_x[-1], True, interpolate=False,
+                                         vision_outputs=self.vision_outputs) # (1, batch_size, #classes, H, W)                                         
+                entropy_per_pixel = self.softmax_entropy(logits)  # Shape: (batch_size, H, W)
+
+                # Average over all pixels and batch samples
+                loss = entropy_per_pixel.mean()
+
+            else:
+                raise Exception("prompt_integration should be either on 'loss' or 'text'")
+        
             loss_report.append(loss.item())
             loss.backward()
             self.optimizer.step()
@@ -179,10 +208,12 @@ class TENT:
     def extract_text_embeddings(self, class_names, prompts, average=True):
         """
         Extracts text embeddings for given class names and prompts.
+
         Args:
             class_names: List of class names to generate text embeddings for.
             prompts: List of prompt templates to use for generating text embeddings.
-            average: Boolean indicating whether to average the embeddings of different templates for each class.
+            average: Boolean indicating whether to average the embeddings of different prompt templates for each class.
+
         Returns:
             text_features: Tensor of text embeddings for the given class names and prompts.
         """
@@ -205,8 +236,10 @@ class TENT:
     def set_ln_grads(model):
         """
         Set gradient settings for LayerNorm layers within the model, disabling gradients globally except for these LN layers.
+
         Args:
             model: The model whose LayerNorm layers' gradients are to be set.
+
         Returns:
             The model with modified gradient settings.
         """
@@ -220,8 +253,10 @@ class TENT:
     def collect_ln_params(model):
         """
         Collect the affine scale and shift parameters from LayerNorm layers.
+
         Args:
             model: The model from which to collect LayerNorm parameters.
+
         Returns:
             params: List of LayerNorm parameters.
             names: List of parameter names.
@@ -240,9 +275,11 @@ class TENT:
     def copy_model_and_optimizer(model, optimizer):
         """
         Copy the model and optimizer states for resetting after adaptation.
+
         Args:
             model: The model to copy.
             optimizer: The optimizer to copy.
+
         Returns:
             model_state: Copied state of the model.
             optimizer_state: Copied state of the optimizer.
@@ -255,6 +292,7 @@ class TENT:
     def load_model_and_optimizer(model, optimizer, model_state, optimizer_state):
         """
         Restore the model and optimizer states from copies.
+
         Args:
             model: The model to restore.
             optimizer: The optimizer to restore.
@@ -265,9 +303,9 @@ class TENT:
         optimizer.load_state_dict(optimizer_state)
 
     @staticmethod
-    def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
+    def softmax_entropy(x: torch.Tensor, dim=-3) -> torch.Tensor:
         """Entropy of softmax distribution from logits.
             x : torch.Tensor : logits of shape (#templates, batch_size, num_classes, H, W)
         """
-        return -(x.softmax(-3) * x.log_softmax(-3)).sum(-3)
+        return -(x.softmax(dim) * x.log_softmax(dim)).sum(dim)
 

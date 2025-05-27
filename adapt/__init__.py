@@ -1,17 +1,19 @@
 import inspect
 from pprint import pprint
 
+from .mlmp import MLMP
 from .clipartt import CLIPARTT
 from .watt import WATT
+from .tpt import TPT
 from .tent import TENT
-from .mtl import MTL
 
 # Map methods to their classes
 METHOD_CLASSES = {
-    'tent': TENT,
+    'mlmp': MLMP,
     'clipartt': CLIPARTT,
     'watt': WATT,
-    'mtl': MTL,
+    'tpt': TPT,
+    'tent': TENT,
 }
 
 
