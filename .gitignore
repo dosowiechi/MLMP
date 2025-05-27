@@ -1,7 +1,4 @@
 results.txt
-./bash
-tmp.sh
-*.sh
 save/
 
 # Byte-compiled / optimized / DLL files
@@ -105,7 +102,3 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-tmp.txt
-tmp.py
-configurations.txt
-bash
