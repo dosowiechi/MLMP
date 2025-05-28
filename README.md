@@ -44,7 +44,7 @@ pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https
 pip install -r requirements.txt
 ```
 
-
+---
 ### Step 2: Prepare Datasets
 
 We evaluate MLMP on seven widely-used segmentation benchmarks, chosen to span indoor/outdoor scenes, object–stuff mixes, and a range of class granularities:
@@ -63,7 +63,7 @@ Additionally, inspired by [ImageNet-C](https://github.com/hendrycks/robustness),
 
 Remember to modify the dataset paths `DATA_DIR` and corruption type in the bash files in `./bash`. 
 
-
+---
 ### Step 3: Perform Adaptation
 
 There are different bash files in `./bash` directory which are prepared to reproduce the results of the paper for **different methods**, **datasets**, and **corruptions**.
