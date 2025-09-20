@@ -1,5 +1,5 @@
 
-# [NeurIPS 2024] Test-Time Adaptation of Vision-Language Models for Open-Vocabulary Semantic Segmentation
+# [NeurIPS 2025] Test-Time Adaptation of Vision-Language Models for Open-Vocabulary Semantic Segmentation
 
 The official implementation of our paper "Test-Time Adaptation of Vision-Language Models for Open-Vocabulary Semantic Segmentation".
 
